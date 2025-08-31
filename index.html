@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Game: Item Collection + Q-learning + Shadow Clones</title>
+  <style>
+    body { margin:0; overflow:hidden; display:flex; justify-content:center; align-items:center; height:100vh; background:#f0f0f0; font-family:Arial, sans-serif; position: relative;}
+    canvas { border:2px solid #333; background:#fff }
+    #hud { position:absolute; top:12px; left:12px; font-size:18px; color:#333; z-index:10;}
+    #gameOver { position:absolute; font-size:40px; color:#e74c3c; display:none; text-align:center; z-index:10; width:100%; top:40%; }
+    #restart { margin-top:12px; padding:8px 14px; font-size:16px; background:#2ecc71; color:white; border:none; border-radius:6px; cursor:pointer }
+    #controls { position:absolute; top:12px; right:12px; background:rgba(255,255,255,0.95); padding:10px; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.1); z-index:10; max-width:340px; width:340px;}
+    #controls label { display:flex; align-items:center; gap:8px }
+    #controls .row { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:8px; font-size:13px; color:#555 }
+    #controls .note { margin-top:6px; font-size:12px; color:#777 }
+
+    #graphContainer {
+      position: absolute;
+      bottom: 12px;
+      right: 12px;
+      background: white;
+      border: 2px solid #333;
+      border-radius: 8px;
+      padding: 10px;
+      width: 360px;
+      height: 200px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+      font-size: 12px;
+      color: #333;
+      user-select: none;
+      z-index: 9;
+    }
+    #graphCanvas {
+      display: block;
+      background: #fff;
+      border: 1px solid #ccc;
+      width: 340px;
+      height: 160px;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">Score: 0 | Items: 0</div>
+  <canvas id="gameCanvas" width="640" height="420"></canvas>
+  <div id="gameOver">
+    Game Over!<br>
+    Your score: <span id="finalScore">0</span><br>
+    <button id="restart">Play Again</button>
+  </div>
+
+  <div id="controls">
+    <div class="row"><label><input id="toggleTrain" type="checkbox" /> Enable AI (Q-learning) on screen</label></div>
+    <div class="row"><label><input id="toggleClones" type="checkbox" /> Enable shadow clones (4×, sync every 20 episodes)</label></div>
+    <div class="row">Alpha (learning rate): <span id="alphaVal">0.10</span></div>
+    <div class="row"><input id="alphaRange" type="range" min="0.05" max="0.9" step="0.05" value="0.10" style="width:100%"></div>
+    <div class="row">Epsilon (ε-greedy): <span id="epsVal">0.25</span></div>
+    <div class="row"><input id="epsRange" type="range" min="0.01" max="0.9" step="0.01" value="0.25" style="width:100%"></div>
+    <div class="note">Clones learn offline and average Q-tables with each other and the visible agent every 20 episodes.</div>
+  </div>
+
+  <div id="graphContainer">
+    <div>Episode reward graph (visible agent and clones)</div>
+    <canvas id="graphCanvas" width="340" height="160"></canvas>
+  </div>
+
+  <script>
+    // --------------------- Main on-screen game ---------------------
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const hud = document.getElementById('hud');
+    const gameOverEl = document.getElementById('gameOver');
+    const finalScoreEl = document.getElementById('finalScore');
+    const restartBtn = document.getElementById('restart');
+
+    const toggleTrain = document.getElementById('toggleTrain');
+    const toggleClones = document.getElementById('toggleClones');
+    const alphaRange = document.getElementById('alphaRange');
+    const epsRange = document.getElementById('epsRange');
+    const alphaVal = document.getElementById('alphaVal');
+    const epsVal = document.getElementById('epsVal');
+
+    // Graph
+    const graphCanvas = document.getElementById('graphCanvas');
+    const ctxGraph = graphCanvas.getContext('2d');
+
+    // Player
+    const player = { x: canvas.width/2 - 25, y: canvas.height/2 - 25, size: 50, speed: 8, color: '#3498db', dx: 0, dy: 0 };
+
+    // Items and game
+    let items = [];
+    let score = 0;
+    let gameActive = true;
+    let spawnTimer = 0;
+    let penaltyTimer = 0;
+    const MAX_ITEMS = 20;
+
+    // Q-learning parameters
+    const actions = [
+      {dx: player.speed, dy: 0},
+      {dx: -player.speed, dy: 0},
+      {dx: 0, dy: player.speed},
+      {dx: 0, dy: -player.speed}
+    ];
+
+    let qTable = {};
+    let alpha = parseFloat(alphaRange.value);
+    const gamma = 0.9;
+    let epsilon = parseFloat(epsRange.value);
+    let trainingEnabled = false;
+
+    // Reward statistics
+    let episodeRewards = [];
+    let currentEpisodeReward = 0;
+    let episodeInProgress = true;
+
+    function createItems(count, w=canvas.width, h=canvas.height) {
+      for (let i = 0; i < count; i++) {
+        const size = 12 + Math.random()*18;
+        items.push({
+          x: Math.random() * (w - size),
+          y: Math.random() * (h - size),
+          size: size,
+          color: `hsl(${Math.random()*360},70%,60%)`,
+          points: Math.floor(1 + Math.random()*5)
+        });
+      }
+      updateItemCount();
+    }
+
+    function updateItemCount() {
+      hud.textContent = `Score: ${score} | Items: ${items.length}/${MAX_ITEMS}`;
+      hud.style.color = (items.length > MAX_ITEMS*0.7) ? '#e74c3c' : '#333';
+    }
+
+    function handleKeyDown(e) {
+      if (!gameActive || trainingEnabled) return;
+      if (e.key === 'ArrowRight' || e.key === 'd') player.dx = player.speed;
+      else if (e.key === 'ArrowLeft' || e.key === 'a') player.dx = -player.speed;
+      else if (e.key === 'ArrowDown' || e.key === 's') player.dy = player.speed;
+      else if (e.key === 'ArrowUp' || e.key === 'w') player.dy = -player.speed;
+    }
+
+    function handleKeyUp(e) {
+      if (!gameActive || trainingEnabled) return;
+      if ((e.key === 'ArrowRight' || e.key === 'd') && player.dx > 0) player.dx = 0;
+      if ((e.key === 'ArrowLeft' || e.key === 'a') && player.dx < 0) player.dx = 0;
+      if ((e.key === 'ArrowDown' || e.key === 's') && player.dy > 0) player.dy = 0;
+      if ((e.key === 'ArrowUp' || e.key === 'w') && player.dy < 0) player.dy = 0;
+    }
+
+    function checkCollisionCollect() {
+      for (let i = items.length - 1; i >= 0; i--) {
+        const it = items[i];
+        if (
+          player.x < it.x + it.size &&
+          player.x + player.size > it.x &&
+          player.y < it.y + it.size &&
+          player.y + player.size > it.y
+        ) {
+          items.splice(i,1);
+          score += it.points;
+          updateItemCount();
+          currentEpisodeReward += 10;
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function checkGameOver() {
+      if (items.length >= MAX_ITEMS) {
+        gameActive = false;
+        episodeInProgress = false;
+        finalScoreEl.textContent = score;
+        gameOverEl.style.display = 'block';
+        currentEpisodeReward -= 100;
+        episodeRewards.push(currentEpisodeReward);
+        if (trainingEnabled) {
+          setTimeout(() => restartGame(), 500);
+        }
+      }
+    }
+
+    function updateHuman() {
+      if (!gameActive) return;
+      player.x += player.dx;
+      player.y += player.dy;
+      if (player.x < 0) player.x = 0;
+      if (player.x + player.size > canvas.width) player.x = canvas.width - player.size;
+      if (player.y < 0) player.y = 0;
+      if (player.y + player.size > canvas.height) player.y = canvas.height - player.size;
+
+      const collected = checkCollisionCollect();
+      if (!collected) currentEpisodeReward -= 0.1;
+
+      spawnTimer++;
+      if (spawnTimer >= 72) { createItems(1); spawnTimer = 0; }
+      checkGameOver();
+
+      if (items.length === 0 && episodeInProgress) {
+        episodeInProgress = false;
+        currentEpisodeReward += 100;
+        episodeRewards.push(currentEpisodeReward);
+      }
+    }
+
+    function draw() {
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle = player.color;
+      ctx.fillRect(player.x, player.y, player.size, player.size);
+      for (let it of items) {
+        ctx.fillStyle = it.color;
+        ctx.beginPath();
+        ctx.arc(it.x + it.size/2, it.y + it.size/2, it.size/2, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    function drawGraph() {
+      ctxGraph.clearRect(0,0,graphCanvas.width,graphCanvas.height);
+      ctxGraph.font = '12px Arial';
+      ctxGraph.fillStyle = '#333';
+      ctxGraph.fillText('Episode reward', 10, 14);
+
+      if (episodeRewards.length === 0) return;
+
+      const margin = 28;
+      const gw = graphCanvas.width - margin*2;
+      const gh = graphCanvas.height - margin*1.5;
+
+      const maxPoints = 80;
+      const startIdx = episodeRewards.length > maxPoints ? episodeRewards.length - maxPoints : 0;
+      const points = episodeRewards.slice(startIdx);
+
+      const maxR = Math.max(...points, 10);
+      const minR = Math.min(...points, -120);
+      const range = (maxR - minR) || 1;
+
+      // axes
+      ctxGraph.strokeStyle = '#999';
+      ctxGraph.lineWidth = 1;
+      ctxGraph.beginPath();
+      ctxGraph.moveTo(margin, margin/2);
+      ctxGraph.lineTo(margin, gh + margin/2);
+      ctxGraph.lineTo(gw + margin, gh + margin/2);
+      ctxGraph.stroke();
+
+      // baseline 0
+      const zeroY = gh + margin/2 - ((0 - minR) / range) * gh;
+      ctxGraph.strokeStyle = '#ddd';
+      ctxGraph.beginPath();
+      ctxGraph.moveTo(margin, zeroY);
+      ctxGraph.lineTo(gw + margin, zeroY);
+      ctxGraph.stroke();
+      ctxGraph.fillStyle = '#666';
+      ctxGraph.fillText('0', 6, zeroY + 4);
+
+      // line
+      ctxGraph.strokeStyle = '#3498db';
+      ctxGraph.lineWidth = 2;
+      ctxGraph.beginPath();
+      points.forEach((r, i) => {
+        const x = margin + (i / Math.max(1, points.length - 1)) * gw;
+        const y = gh + margin/2 - ((r - minR) / range) * gh;
+        if (i === 0) ctxGraph.moveTo(x,y); else ctxGraph.lineTo(x,y);
+      });
+      ctxGraph.stroke();
+    }
+
+    // --------------------- Q-learning for visible agent ---------------------
+    function getNearest(itemsArr, px, py) {
+      if (itemsArr.length === 0) return null;
+      let nearest = itemsArr[0];
+      let minDist = Math.hypot(nearest.x - px, nearest.y - py);
+      for (let i = 1; i < itemsArr.length; i++) {
+        const it = itemsArr[i];
+        const d = Math.hypot(it.x - px, it.y - py);
+        if (d < minDist) { minDist = d; nearest = it; }
+      }
+      return nearest;
+    }
+
+    function getStateFrom(px, py, itemsArr, step=player.speed) {
+      if (itemsArr.length === 0) return [Math.floor(px/step), Math.floor(py/step), 0, 0];
+      const n = getNearest(itemsArr, px, py);
+      const dx = n.x - px;
+      const dy = n.y - py;
+      return [Math.floor(px/step), Math.floor(py/step), Math.floor(dx/step), Math.floor(dy/step)];
+    }
+
+    const getState = () => getStateFrom(player.x, player.y, items);
+
+    const getStateKey = (arr) => arr.join('_');
+    function ensureState(table, key) { if (!table[key]) table[key] = Array(actions.length).fill(0); }
+
+    function chooseAction(table, stateKey, eps) {
+      if (Math.random() < eps) return Math.floor(Math.random()*actions.length);
+      const row = table[stateKey];
+      if (!row) return Math.floor(Math.random()*actions.length);
+      let maxQ = row[0], idxs=[0];
+      for (let i=1;i<row.length;i++){
+        if (row[i] > maxQ) { maxQ=row[i]; idxs=[i]; }
+        else if (row[i] === maxQ) idxs.push(i);
+      }
+      return idxs[Math.floor(Math.random()*idxs.length)];
+    }
+
+    function updateQ(table, stateKey, action, reward, nextStateKey) {
+      ensureState(table, nextStateKey);
+      ensureState(table, stateKey);
+      const maxQNext = Math.max(...table[nextStateKey]);
+      table[stateKey][action] = (1 - alpha) * table[stateKey][action] + alpha * (reward + gamma * maxQNext);
+    }
+
+    function aiStepVisible() {
+      // choose action
+      const sArr = getState();
+      const sKey = getStateKey(sArr);
+      ensureState(qTable, sKey);
+      const aIdx = chooseAction(qTable, sKey, epsilon);
+      const mv = actions[aIdx];
+
+      // movement
+      player.x += mv.dx; player.y += mv.dy;
+      if (player.x < 0) player.x = 0;
+      if (player.x + player.size > canvas.width) player.x = canvas.width - player.size;
+      if (player.y < 0) player.y = 0;
+      if (player.y + player.size > canvas.height) player.y = canvas.height - player.size;
+
+      // reward
+      const collected = checkCollisionCollect();
+      let reward = collected ? 10 : -0.1;
+
+      // Penalty only for Q-learning (doesn't affect game score)
+      if (items.length > 15) {
+        penaltyTimer++;
+        if (penaltyTimer >= 60) { // ~1 second
+          penaltyTimer = 0;
+          reward -= 5; // Only in Q-table
+        }
+      } else {
+        penaltyTimer = 0;
+      }
+
+      currentEpisodeReward += reward;
+
+      const nsArr = getState();
+      const nsKey = getStateKey(nsArr);
+      updateQ(qTable, sKey, aIdx, reward, nsKey);
+
+      // eps decay
+      epsilon = Math.max(0.01, epsilon - 0.00005);
+    }
+
+    function gameStep() {
+      if (!gameActive) return;
+      if (trainingEnabled) {
+        aiStepVisible();
+        spawnTimer++;
+        if (spawnTimer >= 72) { createItems(1); spawnTimer = 0; }
+        checkGameOver();
+        if (items.length === 0 && episodeInProgress) {
+          episodeInProgress = false;
+          currentEpisodeReward += 100;
+          episodeRewards.push(currentEpisodeReward);
+          setTimeout(() => restartGame(), 500);
+        }
+      } else {
+        updateHuman();
+      }
+    }
+
+    function restartGame() {
+      score = 0; items = []; createItems(3);
+      gameActive = true; spawnTimer = 0; penaltyTimer = 0;
+      episodeInProgress = true; currentEpisodeReward = 0;
+      player.x = canvas.width/2 - player.size/2; player.y = canvas.height/2 - player.size/2;
+      player.dx = 0; player.dy = 0;
+      gameOverEl.style.display = 'none';
+    }
+
+    // --------------------- Shadow clones (4×) ---------------------
+    const NUM_CLONES = 4;
+    const SYNC_EVERY = 20;
+    let clonesEnabled = false;
+    let clones = [];
+    let cloneTimerId = null;
+
+    function makeCloneEnv() {
+      return {
+        px: canvas.width/2 - player.size/2,
+        py: canvas.height/2 - player.size/2,
+        items: (()=>{ const arr=[]; for(let i=0;i<6;i++){ const size=12+Math.random()*18; arr.push({
+          x: Math.random()*(canvas.width-size),
+          y: Math.random()*(canvas.height-size),
+          size, points: Math.floor(1+Math.random()*5),
+          color: `hsl(${Math.random()*360},70%,60%)`
+        }); } return arr; })(),
+        spawnTimer: 0,
+        rewardSum: 0,
+        done: false
+      };
+    }
+
+    function initClones() {
+      clones = [];
+      for (let i=0;i<NUM_CLONES;i++) {
+        clones.push({
+          q: deepCloneQ(qTable),
+          eps: Math.max(0.05, epsilon),
+          episodesDone: 0,
+          env: makeCloneEnv()
+        });
+      }
+    }
+
+    function deepCloneQ(table) {
+      const res = {};
+      for (const k in table) res[k] = table[k].slice();
+      return res;
+    }
+
+    function mergeAverageQ(qTables) {
+      const merged = {};
+      const keys = new Set();
+      qTables.forEach(t => Object.keys(t).forEach(k => keys.add(k)));
+      keys.forEach(k => {
+        let acc = [0,0,0,0], cnt = 0;
+        qTables.forEach(t => {
+          if (t[k]) {
+            acc[0]+=t[k][0]; acc[1]+=t[k][1]; acc[2]+=t[k][2]; acc[3]+=t[k][3];
+            cnt++;
+          }
+        });
+        if (cnt>0) merged[k] = acc.map(v => v / cnt);
+      });
+      return merged;
+    }
+
+    function cloneStep(c) {
+      if (c.env === null || c.env.done) {
+        if (c.env && c.env.done) {
+          episodeRewards.push(c.env.rewardSum);
+          c.episodesDone++;
+        }
+        if (c.episodesDone >= SYNC_EVERY) return;
+        c.env = makeCloneEnv();
+      }
+
+      const env = c.env;
+      const sArr = getStateFrom(env.px, env.py, env.items);
+      const sKey = getStateKey(sArr);
+      if (!c.q[sKey]) c.q[sKey] = [0,0,0,0];
+
+      const aIdx = chooseAction(c.q, sKey, c.eps);
+      const mv = actions[aIdx];
+
+      env.px += mv.dx; env.py += mv.dy;
+      if (env.px < 0) env.px = 0;
+      if (env.px + player.size > canvas.width) env.px = canvas.width - player.size;
+      if (env.py < 0) env.py = 0;
+      if (env.py + player.size > canvas.height) env.py = canvas.height - player.size;
+
+      let collected = false;
+      for (let i = env.items.length - 1; i >= 0; i--) {
+        const it = env.items[i];
+        if (env.px < it.x + it.size && env.px + player.size > it.x && env.py < it.y + it.size && env.py + player.size > it.y) {
+          env.items.splice(i,1); collected = true; break;
+        }
+      }
+
+      let reward = collected ? 10 : -0.1;
+      
+      // Penalty for clones (only in Q-learning)
+      if (env.items.length > 15) {
+        reward -= 5/60; // Proportional to steps
+      }
+
+      env.rewardSum += reward;
+
+      const nsArr = getStateFrom(env.px, env.py, env.items);
+      const nsKey = getStateKey(nsArr);
+      if (!c.q[nsKey]) c.q[nsKey] = [0,0,0,0];
+      
+      const maxQNext = Math.max(...c.q[nsKey]);
+      c.q[sKey][aIdx] = (1 - alpha) * c.q[sKey][aIdx] + alpha * (reward + gamma * maxQNext);
+
+      env.spawnTimer++;
+      if (env.spawnTimer >= 72) {
+        const size = 12 + Math.random()*18;
+        env.items.push({
+          x: Math.random()*(canvas.width-size),
+          y: Math.random()*(canvas.height-size),
+          size, points: Math.floor(1+Math.random()*5),
+          color: `hsl(${Math.random()*360},70%,60%)`
+        });
+        env.spawnTimer = 0;
+      }
+
+      if (env.items.length === 0) { env.rewardSum += 100; env.done = true; }
+      if (env.items.length >= MAX_ITEMS) { env.rewardSum -= 100; env.done = true; }
+
+      c.eps = Math.max(0.01, c.eps * 0.999);
+    }
+
+    function clonesTick() {
+      for (let i=0;i<NUM_CLONES;i++) {
+        const c = clones[i];
+        if (c.episodesDone < SYNC_EVERY) {
+          for (let s=0; s<8; s++) cloneStep(c);
+        }
+      }
+
+      const allReady = clones.every(c => c.episodesDone >= SYNC_EVERY);
+      if (allReady) {
+        const merged = mergeAverageQ(clones.map(c => c.q));
+        qTable = merged;
+        for (let i=0;i<NUM_CLONES;i++) {
+          clones[i].q = deepCloneQ(qTable);
+          clones[i].episodesDone = 0;
+          clones[i].env = null;
+        }
+      }
+    }
+
+    function startClones() {
+      if (cloneTimerId) return;
+      initClones();
+      cloneTimerId = setInterval(clonesTick, 20);
+    }
+
+    function stopClones() {
+      if (cloneTimerId) { clearInterval(cloneTimerId); cloneTimerId = null; }
+      clones = [];
+    }
+
+    // --------------------- Events and startup ---------------------
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    restartBtn.addEventListener('click', () => { restartGame(); });
+
+    toggleTrain.addEventListener('change', (e) => {
+      trainingEnabled = e.target.checked;
+      if (trainingEnabled) { player.dx = 0; player.dy = 0; }
+    });
+
+    toggleClones.addEventListener('change', (e) => {
+      clonesEnabled = e.target.checked;
+      if (clonesEnabled) startClones(); else stopClones();
+    });
+
+    alphaRange.addEventListener('input', () => {
+      alpha = parseFloat(alphaRange.value);
+      alphaVal.textContent = alpha.toFixed(2);
+    });
+
+    epsRange.addEventListener('input', () => {
+      epsilon = parseFloat(epsRange.value);
+      epsVal.textContent = epsilon.toFixed(2);
+    });
+
+    function mainLoop() {
+      gameStep();
+      draw();
+      drawGraph();
+      requestAnimationFrame(mainLoop);
+    }
+
+    restartGame();
+    requestAnimationFrame(mainLoop);
+  </script>
+</body>
+</html>
